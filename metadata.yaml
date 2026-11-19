@@ -1,4 +1,4 @@
 name: astrbot_plugin_peer
-desc: 群友人格（狼人/淋语/猎奇） + 答不上来就不出声
+desc: 像群友一样聊天的人格与行为插件（人格可配置、发言闸门、表情包、水群）
 author: local
-version: 1.0.0
+version: 1.1.0
