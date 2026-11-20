@@ -8,6 +8,8 @@ built-in default below and is recreated on startup.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import random
 import re
@@ -21,6 +23,10 @@ from astrbot.api import logger, star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Plain
 from astrbot.core.message.message_event_result import MessageChain
+
+# 指令自声明（插件开发规范要求，见 docs/PLUGIN-DEV.md）：本插件无斜线指令
+DECLARED_COMMANDS: dict[str, tuple[str, str]] = {}
+DECLARED_BEHAVIOR = "无斜线指令：群聊人格回复仲裁、注入防护、刷屏拦截、闲时主动搭话（全被动行为）"
 
 DB = Path(r"D:\QQNTBOT\apps\AstrBot\data\data_v4.db")
 PERSONA_FILE = Path(r"D:\QQNTBOT\data\persona.json")
@@ -389,6 +395,8 @@ VISION_HINTS = (
     "啥图", "什么图",
     "这啥", "是啥", "啥意思", "什么意思", "长啥样", "什么样",
     "识别", "翻译", "描述一下", "描述下",
+    # 让它评价/打分这类也是冲着图来的（「评价一下」不带「看」字）
+    "评价", "评一下", "点评", "打分", "咋样", "怎么样", "几分",
 )
 
 # 读图预算单列，不跟聊天共用。原图一张 1000~2000 token，描述一句约 30 token。
@@ -421,7 +429,7 @@ def _strip_vision_noise(text: str) -> str:
     return text
 
 
-def _should_read_images(text: str, images: list) -> bool:
+def _should_read_images(text: str, images: list, waked: bool = False) -> bool:
     """Decide whether the third-party model should actually look at images.
 
     Stickers and reaction images should not burn vision tokens, so we only send
@@ -432,12 +440,16 @@ def _should_read_images(text: str, images: list) -> bool:
     Args:
         text: The message text.
         images: Image payloads attached to the request.
+        waked: True when the bot was @-mentioned / woken up. 特意 @ 它发图，
+            就是冲着这张图来的——@+纯图却不给看是最伤的误判（模型只能装瞎）。
 
     Returns:
         True when the images are worth sending.
     """
     if not images:
         return False
+    if waked:
+        return True
     lowered = _strip_vision_noise((text or "").lower())
     if any(hint in lowered for hint in VISION_HINTS):
         return True
@@ -451,6 +463,308 @@ def _should_read_images(text: str, images: list) -> bool:
         if isinstance(url, str) and len(url) > 25000:
             return True
     return False
+
+
+def _to_data_url(url: str) -> str:
+    """Turn a local file path into a base64 data URL for the vision API.
+
+    第三方模型下载不了本地路径——直接把 file:///D:/... 塞进 image_urls，
+    模型只会在上下文里看到一串路径文本，然后老实承认「只看到路径」。
+    http(s) 和 data: 原样放行；本地文件读出来转 base64；读不到返回空串。
+
+    Args:
+        url: Image reference, either a remote URL or a local path.
+
+    Returns:
+        A URL the third-party API can actually consume, or "" if unreadable.
+    """
+    if not url or url.startswith(("http://", "https://", "data:")):
+        return url
+    lowered = url.lower()
+    # file:///D:/x.jpg（三斜杠，本地盘）切 8 位；file://host/x 是网络主机，切 7 位
+    if lowered.startswith("file:///"):
+        path = Path(url[8:])
+    elif lowered.startswith("file://"):
+        path = Path(url[7:])
+    else:
+        path = Path(url)
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return ""
+    suffix = path.suffix.lstrip(".").lower()
+    if suffix == "jpg":
+        suffix = "jpeg"
+    if suffix not in ("jpeg", "png", "gif", "webp", "bmp"):
+        suffix = "jpeg"
+    return (
+        f"data:image/{suffix};base64,"
+        + base64.b64encode(raw).decode("ascii")
+    )
+
+
+RECENT_PIN_DIR = Path(r"D:\QQNTBOT\data\temp\peer_recent")
+PIN_MAX_BYTES = 20 * 1024 * 1024   # 超过 20MB 的不快照
+PIN_KEEP_FILES = 300               # 目录超这个数就清 6 小时前的旧快照
+
+
+def _url_path(url: str) -> Path | None:
+    """Resolve a file:/// URL or plain path to a local Path, else None."""
+    if not url:
+        return None
+    lowered = url.lower()
+    if lowered.startswith("file:///"):
+        return Path(url[8:])
+    if lowered.startswith("file://"):
+        return Path(url[7:])
+    if url.startswith(("http://", "https://", "data:")):
+        return None
+    return Path(url)
+
+
+async def _pin_image(url: str) -> str:
+    """Snapshot a volatile image to a stable local path and return that path.
+
+    QQ 发来的图在 NapCat 侧是 file:/// 临时文件，几十秒内就会被清掉；
+    多媒体 URL 的 rkey 也会过期。第一轮读得到、跨轮重读就 404——
+    「你刚发的那个是啥」这种追问全断在这。第一轮就把字节复制进固定
+    目录（文件名=内容 sha，重发同一张不重复存），跨轮记忆改存快照路径。
+    已经在快照目录里或读不到的，原样返回。
+
+    Args:
+        url: Image reference (http URL, file:/// URL or plain local path).
+
+    Returns:
+        A stable local path (str), or the original ``url`` when pinning is
+        unnecessary or impossible.
+    """
+    if not url or url.startswith("data:"):
+        return url
+    src = _url_path(url)
+    if src is None:
+        # 远程 URL：下载一份。失败就退回原 URL，第一轮还能看
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+            raw = resp.content
+        except Exception as exc:  # noqa: BLE001 - pinning is best effort
+            logger.debug(f"[peer] pin download failed: {exc}")
+            return url
+    else:
+        try:
+            raw = src.read_bytes()
+        except OSError:
+            return url
+        # 表情包目录里的图是常驻资产，不用快照
+        try:
+            if MEME_ROOT in src.parents or src.parent == MEME_ROOT:
+                return url
+        except OSError:
+            pass
+    if not raw or len(raw) > PIN_MAX_BYTES:
+        return url
+    try:
+        RECENT_PIN_DIR.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(raw).hexdigest()[:16]
+        head = raw[:4]
+        suffix = (
+            ".gif" if head[:3] == b"GIF"
+            else ".png" if head == b"\x89PNG"
+            else ".webp" if head[:4] == b"RIFF"
+            else ".jpg"
+        )
+        pinned = RECENT_PIN_DIR / f"{digest}{suffix}"
+        if not pinned.exists():
+            pinned.write_bytes(raw)
+        _pin_gc()
+        return str(pinned)
+    except OSError as exc:
+        logger.debug(f"[peer] pin write failed: {exc}")
+        return url
+
+
+def _pin_gc() -> None:
+    """Keep the snapshot dir small: drop 6-hour-old files when it grows big."""
+    try:
+        files = [p for p in RECENT_PIN_DIR.iterdir() if p.is_file()]
+        if len(files) <= PIN_KEEP_FILES:
+            return
+        now = time.time()
+        for old in files:
+            if now - old.stat().st_mtime > 21600:
+                old.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------- 跨轮图片记忆 / 按需细看
+# 表情包包里本来就有分好类的类型描述（manifest.json），识图缓存里也有每张图
+# 的画面描述。群里刚出现过一张图时，先把这段「大概是什么」常驻进上下文
+# （零成本），只有对方仔细追问才升级到真看图。这样「这表情包啥意思」不用
+# 烧 token，「里面怎么是小狗啊」才真的去看画面。
+RECENT_IMAGE_TTL = 300.0           # 「上文刚有图」的有效期（秒）
+DETAIL_COOLDOWN = 90.0             # 同一张图仔细看完后多久内不重复升级
+MEME_MANIFEST = MEME_ROOT / "furry" / "manifest.json"
+_RECENT_IMAGE: dict[str, dict] = {}
+_MEME_DESC: dict = {"mtime": 0.0, "data": {}}
+
+
+def _meme_category_desc(category: str) -> str:
+    """Return the sticker pack's own short description for one category.
+
+    Args:
+        category: Folder name under ``furry/memes``.
+
+    Returns:
+        The Chinese description from manifest.json, or "" when unavailable.
+    """
+    if not category:
+        return ""
+    try:
+        stat = MEME_MANIFEST.stat()
+        if _MEME_DESC["mtime"] != stat.st_mtime:
+            raw = json.loads(MEME_MANIFEST.read_text(encoding="utf-8"))
+            cats = raw.get("categories", {})
+            _MEME_DESC["data"] = {
+                name: str((info or {}).get("description", "")).strip()
+                for name, info in cats.items()
+            }
+            _MEME_DESC["mtime"] = stat.st_mtime
+    except Exception as exc:  # noqa: BLE001 - 包坏了不能挡住发图
+        logger.debug(f"[peer] meme manifest unreadable: {exc}")
+        return ""
+    return _MEME_DESC["data"].get(category, "")
+
+
+def _event_key(event) -> str:
+    """A short per-session key for the recent-image memory."""
+    try:
+        group = str(event.get_group_id() or "").strip()
+        if group:
+            return "g:" + group
+        return "u:" + str(event.get_sender_id() or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _remember_image(key: str, url: str, brief: str, sha: str = "", sent_by: str = "user") -> None:
+    """Record the most recent image in a session for later follow-ups.
+
+    Args:
+        key: Per-group / per-user session key.
+        url: Original image reference (path or URL), kept so we can re-read it.
+        brief: Free rough description (pack category text or cached caption).
+        sha: Image fingerprint, used to pick up a later background caption.
+        sent_by: "bot" when the bot itself sent this image, else "user".
+    """
+    if not key or not url:
+        return
+    _RECENT_IMAGE[key] = {
+        "url": url,
+        "sha": sha,
+        "brief": brief or "一张刚出现过的图（还没细看过）",
+        "ts": time.time(),
+        "sent_by": sent_by,
+    }
+    if len(_RECENT_IMAGE) > 64:
+        now = time.time()
+        for old_key, rec in list(_RECENT_IMAGE.items()):
+            if now - rec["ts"] > RECENT_IMAGE_TTL:
+                _RECENT_IMAGE.pop(old_key, None)
+
+
+def _recent_image(key: str) -> dict:
+    """Return a still-fresh recent image record, or an empty dict."""
+    rec = _RECENT_IMAGE.get(key)
+    if not rec:
+        return {}
+    if time.time() - rec["ts"] > RECENT_IMAGE_TTL:
+        _RECENT_IMAGE.pop(key, None)
+        return {}
+    return rec
+
+
+def _wants_image_detail(event, text: str) -> bool:
+    """Structural check for a close-up question, without any keyword list.
+
+    被 @ / 唤醒，或带问号，就算「仔细问这张图」。这里刻意不用词表：
+    VISION_HINTS 那种枚举词已经踩过误触（地图上/图鉴）和漏判（认下/念下）
+    的坑，再加一张表只会继续打补丁。
+
+    Args:
+        event: The current message event.
+        text: Message text.
+
+    Returns:
+        True when the caller is likely asking about picture details.
+    """
+    waked = bool(getattr(event, "is_at_or_wake_command", False))
+    return bool(waked or "?" in (text or "") or "？" in (text or ""))
+
+
+async def _upgrade_recent_image(event, req, rec: dict) -> None:
+    """Re-read the earlier image on demand, split by the current chat mode.
+
+    第三方模式（deepseek-flash 自己支持 image）：把原图补进 image_urls 让主模型
+    一次看完作答；本地模式（9B 不看图）：让 8085 出一份详细档描述注入 prompt。
+    两条路都不二次生成回复。
+
+    Args:
+        event: The current message event.
+        req: The LLM request being assembled.
+        rec: Recent-image record from ``_recent_image``.
+    """
+    key = _event_key(event)
+    url = rec.get("url", "")
+    if _vision_mode() == "off":
+        req.prompt = (
+            (req.prompt or "")
+            + "\n[图片] 识图关着，看不到刚才那张图的细节，别猜，直说看不了"
+        )
+        logger.info(f"[peer] detail upgrade skipped (vision off): {key}")
+        return
+    if _third_party_mode():
+        data = _to_data_url(url)
+        if not data:
+            req.prompt = (
+                (req.prompt or "")
+                + "\n[图片] 刚才那张图取不到了，别编画面细节"
+            )
+            logger.warning(f"[peer] detail upgrade: image unreadable {key}")
+            return
+        req.image_urls = [data]
+        req.prompt = (
+            (req.prompt or "")
+            + "\n[图片] 上面是刚才那张图的原图，仔细看画面细节再回答，"
+            "别只照搬前面的大概描述"
+        )
+        rec["detail_at"] = time.time()
+        logger.info(f"[peer] detail upgrade: original image sent ({key})")
+        return
+    # 本地模式：主模型不吃图，让本地 VL 出详细档
+    detail = await _caption_local(url, detail=True)
+    if detail.startswith("（读图能力不可用"):
+        hit = _vision_peek(rec["sha"]) if rec.get("sha") else ""
+        if hit:
+            req.prompt = (req.prompt or "") + "\n[刚才那张图·仔细看] " + hit
+            rec["brief"] = hit
+            logger.info(f"[peer] detail upgrade: reused cached caption ({key})")
+        else:
+            req.prompt = (
+                (req.prompt or "")
+                + "\n[图片] 本地读图没起来，看不了细节，别猜"
+            )
+            logger.warning(f"[peer] detail upgrade: local VL down ({key})")
+            return
+    else:
+        req.prompt = (req.prompt or "") + "\n[刚才那张图·仔细看] " + detail
+        # 详细档写回记忆：之后同图再问就免费复用，不用重跑 VL
+        rec["brief"] = detail
+        logger.info(f"[peer] detail upgrade: local VL caption ({key})")
+    rec["detail_at"] = time.time()
 
 
 def _vision_mode() -> str:
@@ -513,11 +827,14 @@ def _caption_plan(size: int, raw: bytes = b"") -> tuple[str, int, int]:
     )
 
 
-async def _caption_local(url: str) -> str:
+async def _caption_local(url: str, detail: bool = False) -> str:
     """Caption one image with the local VL server.
 
     Args:
         url: Data URL or local file path of the image.
+        detail: Force the long-form instruction (used when someone asks about
+            picture details on a follow-up turn, where the 90-char sticker
+            caption is too coarse).
 
     Returns:
         Caption text, or an explicit unavailable marker.
@@ -544,7 +861,16 @@ async def _caption_local(url: str) -> str:
             return "（读图能力不可用）"
         url = "data:image/png;base64," + base64.b64encode(raw).decode()
 
-    instruction, max_tokens, cap = _caption_plan(len(raw), raw)
+    if detail:
+        instruction, max_tokens, cap = (
+            "仔细看这张图，把画面细节说清楚：主体是什么（是猫是狗还是别的）、"
+            "在做什么、颜色、姿势、图上的文字照抄、有没有容易看错的地方。"
+            "逐项说，别只概括情绪，不超过 320 字。",
+            600,
+            VISION_CONTENT_CHARS,
+        )
+    else:
+        instruction, max_tokens, cap = _caption_plan(len(raw), raw)
     payload = {
         "model": "Qwen3VL-4B-Instruct",
         "messages": [{
@@ -747,6 +1073,26 @@ def _vision_peek(sha: str) -> str:
     return row[0]
 
 
+def _image_brief(url: str, fallback: str = "") -> tuple[str, str]:
+    """Build a rough description for the recent-image memory.
+
+    Prefers a caption already in the vision cache (most accurate, free); falls
+    back to the sticker pack's category text or a neutral placeholder.
+
+    Args:
+        url: Image reference (local path or data URL).
+        fallback: Text to use when no cached caption exists (e.g. a category
+            description for a sticker the bot just sent).
+
+    Returns:
+        ``(rough_description, sha256_hex)``; sha is "" when unreadable.
+    """
+    _raw, sha = _image_blob(url)
+    caption = _vision_peek(sha) if sha else ""
+    brief = caption or fallback or "一张刚出现过的图（还没细看过）"
+    return brief, sha
+
+
 def _split_images(
     urls: list[str], budget: int = VISION_PROMPT_CHARS
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str, int]], int]:
@@ -806,23 +1152,63 @@ def _vision_watches(group_id: str) -> bool:
     return group_id in (groups or set())
 
 
+_PRIV_WATCH_CACHE: tuple[float, tuple[bool, set[str]]] = (0.0, (False, set()))
+
+
+def _private_vision_watches(qq: str) -> bool:
+    """Check whether ``vision_context`` also captions this private chat.
+
+    Same rules as the ``/私聊`` whitelist: when ``enable_id_white_list`` is
+    off everyone is allowed; when on, only ``qq:FriendMessage:<qq>`` entries.
+    """
+    global _PRIV_WATCH_CACHE
+    cfg_path = Path(r"D:\QQNTBOT\apps\AstrBot\data\cmd_config.json")
+    try:
+        mtime = cfg_path.stat().st_mtime
+    except OSError:
+        return False
+    stamp, cached = _PRIV_WATCH_CACHE
+    if mtime != stamp:
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+            ps = cfg["platform_settings"]
+            entries = ps.get("id_whitelist", [])
+            cached = (not ps.get("enable_id_white_list", False), {
+                str(e).rsplit(":", 1)[-1]
+                for e in entries
+                if "FriendMessage" in str(e)
+            })
+        except Exception:  # noqa: BLE001
+            cached = (False, set())
+        _PRIV_WATCH_CACHE = (mtime, cached)
+    open_all, privs = cached
+    return open_all or qq in privs
+
+
 async def _wait_for_captions(
-    unseen: list[tuple[str, str, int]], group_id: str
+    unseen: list[tuple[str, str, int]], group_id: str, sender_id: str = ""
 ) -> float:
     """Give the background captioner a few seconds before sending raw images.
 
     Sending an image costs 1000~2000 tokens; waiting ~2 s for the caption costs
     nothing and usually wins. Bounded by ``VISION_WAIT_SECONDS`` and skipped
-    entirely when the captioner is not watching this group.
+    entirely when the captioner is not watching this chat (group or private).
 
     Args:
         unseen: ``(url, sha, size)`` triples with no cached caption yet.
-        group_id: Current group number.
+        group_id: Current group number, empty in private chats.
+        sender_id: Sender QQ in private chats (ignored for groups).
 
     Returns:
         Seconds actually spent waiting (0 when nothing was waited for).
     """
-    if not group_id or not _vision_watches(group_id):
+    if group_id:
+        if not _vision_watches(group_id):
+            return 0.0
+    elif sender_id:
+        if not _private_vision_watches(sender_id):
+            return 0.0
+    else:
         return 0.0
     # 云端兜底只补 ≤1.5 MiB 的图，更大的等也等不到
     shas = [sha for _u, sha, size in unseen if sha and size <= VISION_STICKER_BYTES]
@@ -1120,6 +1506,11 @@ class Main(star.Star):
         try:
             await event.send(event.image_result(str(chosen)))
             logger.info(f"[peer] sent meme {chosen.parent.name}/{chosen.name}")
+            desc = _meme_category_desc(chosen.parent.name)
+            brief, sha = _image_brief(
+                str(chosen), desc or f"一张「{chosen.parent.name}」类表情包"
+            )
+            _remember_image(_event_key(event), str(chosen), brief, sha, sent_by="bot")
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[peer] meme send failed: {exc}")
@@ -1149,12 +1540,14 @@ class Main(star.Star):
                 scores[name] = hit_bot + hit_user * 2
         return scores
 
-    def _attach_meme(self, result, text: str, user_text: str = "") -> None:
+    def _attach_meme(self, result, text: str, user_text: str = "", event=None) -> None:
         """Append a random sticker to an outgoing reply.
 
         Args:
             result: The message result about to be sent.
             text: The reply text, used to pick a matching category.
+            user_text: The message that triggered the reply.
+            event: Originating event, used to remember the sticker per group.
         """
         memes = MEME_ROOT / "furry" / "memes"
         if not memes.is_dir() or result is None or not result.chain:
@@ -1182,6 +1575,14 @@ class Main(star.Star):
         try:
             result.chain.append(Image.fromFileSystem(str(chosen)))
             logger.info(f"[peer] attached meme {chosen.parent.name}/{chosen.name}")
+            desc = _meme_category_desc(chosen.parent.name)
+            brief, sha = _image_brief(
+                str(chosen), desc or f"一张「{chosen.parent.name}」类表情包"
+            )
+            if event is not None:
+                _remember_image(
+                    _event_key(event), str(chosen), brief, sha, sent_by="bot"
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[peer] attach meme failed: {exc}")
 
@@ -1190,13 +1591,23 @@ class Main(star.Star):
         """Log the assembled system prompt once per boot, to spot conflicts."""
         # 主模型是纯文本的：把图片转成文字，别让 9B 收到 image 参数（会 500）
         # 本地 9B 不支持图片输入，会 500；第三方 DeepSeek 支持，但只在必要时读图
+        recent_key = _event_key(event)
         if req.image_urls:
+            # 记住本轮这张图。「你这个表情包里怎么是小狗」这类跨轮追问
+            # 本轮不带图，只有靠这条记录才能找回原图和大概描述。
+            # 先快照：QQ 临时文件/远程 URL 几十秒就失效，跨轮必须用稳定路径
+            pinned = await _pin_image(req.image_urls[0])
+            _brief, _sha = _image_brief(pinned)
+            _remember_image(recent_key, pinned, _brief, _sha)
             if not _third_party_mode():
                 logger.info(f"[peer] stripped {len(req.image_urls)} image(s) from request")
                 req.image_urls = []
             else:
                 mode = _vision_mode()
-                wants_image = _should_read_images(event.message_str or "", req.image_urls)
+                waked = bool(getattr(event, "is_at_or_wake_command", False))
+                wants_image = _should_read_images(
+                    event.message_str or "", req.image_urls, waked
+                )
                 if mode == "off" or not wants_image:
                     if mode == "off" and wants_image:
                         # 关掉识图时别装看得见：留一句话，让它老实说自己不看图
@@ -1238,11 +1649,15 @@ class Main(star.Star):
                     # 一张图就是 1000~2000 token，能省就省
                     total = len(req.image_urls)
                     group_id = str(event.get_group_id() or "")
+                    sender_id = "" if group_id else str(event.get_sender_id() or "")
                     notes, unseen, budget = _split_images(req.image_urls)
                     if unseen:
                         # 有图就多等几秒：后台 flash 补描述通常 1.5 秒就回来，
                         # 等到了就不用把原图发出去（省 1500 token，答案还更稳）
-                        waited = await _wait_for_captions(unseen, group_id)
+                        # 私聊也等：vision_context 现在私聊也写缓存
+                        waited = await _wait_for_captions(
+                            unseen, group_id, sender_id
+                        )
                         if waited >= 0.5:
                             logger.info(
                                 f"[peer] waited {waited:.1f}s for background caption"
@@ -1265,6 +1680,22 @@ class Main(star.Star):
                             + " / ".join(text for text, _sha in notes)
                         )
                     req.image_urls = [url for url, _sha, _size in unseen[:VISION_MAX_IMAGES]]
+                    # 本地路径必须转 base64，否则第三方模型只看到一串路径文本；
+                    # 读不到的图撤下来并入「没看」口径，别让路径文本污染上下文
+                    sendable = []
+                    for _url in req.image_urls:
+                        converted = _to_data_url(_url)
+                        if converted:
+                            sendable.append(converted)
+                    unreadable = len(req.image_urls) - len(sendable)
+                    req.image_urls = sendable
+                    sent = len(sendable)
+                    dropped += unreadable
+                    if unreadable:
+                        logger.warning(
+                            f"[peer] {unreadable} image(s) unreadable "
+                            "(local path), dropped from request"
+                        )
                     if dropped > 0:
                         # 被裁掉的图不能装没事：模型不知道有图就会答得牛头不对马嘴。
                         # 告诉它「还有几张没看，可以直说不想看」，比让它瞎猜强。
@@ -1278,6 +1709,39 @@ class Main(star.Star):
                         f"{sent} sent to model, {dropped} dropped, "
                         f"caption budget left {budget}"
                     )
+        else:
+            # 本轮没带图，但上文刚出现过一张图（跨轮追问）。
+            # 先把已有的大概描述免费利用上，只有仔细问才升级到真看图。
+            rec = _recent_image(recent_key)
+            if rec:
+                brief = (rec.get("brief", "") or "")[:120]
+                # vision_context 也会注入「群里最近发过的图」，两边别重复
+                already = (req.prompt or "") + (req.system_prompt or "")
+                if brief and brief not in already:
+                    if rec.get("sent_by") == "bot":
+                        # 这张是机器人自己发的：明确告诉模型它发了什么，
+                        # 免得下一轮被问「你刚发的那个是啥」时一问三不知
+                        req.prompt = (
+                            (req.prompt or "")
+                            + f"\n[你刚才发的表情包] {brief}"
+                            "（大概内容；对方细问画面就说看不清）"
+                        )
+                    else:
+                        req.prompt = (
+                            (req.prompt or "")
+                            + f"\n[刚才那张图] {brief}"
+                            "（大概描述，细节别编；对方细问就说看不清）"
+                        )
+                cooling = time.time() - rec.get("detail_at", 0) < DETAIL_COOLDOWN
+                if cooling:
+                    # 刚仔细看过同一张图，模型上下文里已有上一条带图回复，
+                    # 别反复把原图塞进来白烧 token
+                    logger.info(f"[peer] follow-up detail in cooldown: {recent_key}")
+                elif _wants_image_detail(event, event.message_str or ""):
+                    await _upgrade_recent_image(event, req, rec)
+                    logger.info(f"[peer] follow-up detail upgrade: {recent_key}")
+                else:
+                    logger.info(f"[peer] follow-up brief reused: {recent_key}")
 
         # 群聊里给当前消息标上说话人，和历史块的格式保持一致
         group_id = str(event.get_group_id() or "")
@@ -1323,7 +1787,7 @@ class Main(star.Star):
                 comp.text = _hoist_markers(inner)
         text = result.get_plain_text().strip()
         if random.random() < load_reply_config()["meme_chance"]:
-            self._attach_meme(result, text, event.message_str or "")
+            self._attach_meme(result, text, event.message_str or "", event)
         for rule in load_reply_config()["text_rules"]:
             try:
                 pattern = re.compile(rule["pattern"])
