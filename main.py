@@ -31,6 +31,22 @@ DECLARED_BEHAVIOR = "无斜线指令：群聊人格回复仲裁、注入防护�
 DB = Path(r"D:\QQNTBOT\apps\AstrBot\data\data_v4.db")
 PERSONA_FILE = Path(r"D:\QQNTBOT\data\persona.json")
 
+# 进群提醒文本：权威定义在 access 插件（开关指令的「状态」预览同一份），
+# 单拎 peer 时用这里的兜底文案。
+try:
+    import sys as _sys
+
+    _sys.path.insert(
+        0, str(Path(__file__).parent.parent / "astrbot_plugin_access")
+    )
+    from astrbot_plugin_access.main import WELCOME_TEXT
+except Exception:  # noqa: BLE001 - access 不在时也能用
+    WELCOME_TEXT = (
+        "欢迎进群喵～我是本群的骰子娘兼气氛组。\n"
+        "掷骰：/r 1d20、/r 2d6+3（也可以直接说「掷骰」）\n"
+        "@我 可以聊天。"
+    )
+
 OPENERS = [
     "（从纸箱里探出半个脑袋）喵？都熟睡了？",
     "（伸懒腰，尾巴甩到屏幕上）这群安静得，本喵都不好意思说话了",
@@ -49,6 +65,53 @@ OPENERS = [
 ]
 
 WATER_FILE = Path(r"D:\QQNTBOT\data\water.json")
+
+# 群开关文件（access 插件的 /群聊 /进群提醒 写入，本插件只读）。
+# 文件不存在 = 一切照旧（单拎兼容），与 access 的默认值保持一致：
+# proactive 默认关、reply_at 默认开、welcome 默认关。
+GROUP_FLAGS_FILE = Path(
+    r"D:\QQNTBOT\apps\AstrBot\data\plugins\astrbot_plugin_access\group_flags.json"
+)
+GROUP_FLAG_DEFAULTS = {"proactive": False, "reply_at": True, "welcome": False}
+_flags_cache: dict = {"mtime": 0.0, "data": None}
+
+
+def load_group_flags() -> dict[str, dict]:
+    """Read per-group switches from the access plugin's file (mtime cached)."""
+    global _flags_cache
+    try:
+        stat = GROUP_FLAGS_FILE.stat()
+    except OSError:
+        return {}
+    if _flags_cache["data"] is not None and stat.st_mtime == _flags_cache["mtime"]:
+        return _flags_cache["data"]
+    try:
+        raw = json.loads(GROUP_FLAGS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    groups: dict[str, dict] = {}
+    for gid, conf in (raw.get("groups") or {}).items():
+        if isinstance(conf, dict):
+            entry = dict(GROUP_FLAG_DEFAULTS)
+            entry.update({k: bool(v) for k, v in conf.items() if k in GROUP_FLAG_DEFAULTS})
+            groups[str(gid)] = entry
+    _flags_cache = {"mtime": stat.st_mtime, "data": groups}
+    return groups
+
+
+def group_flag(gid: str, key: str) -> bool:
+    """One switch for one group; unconfigured groups fall back to defaults."""
+    conf = load_group_flags().get(str(gid)) or {}
+    return bool(conf.get(key, GROUP_FLAG_DEFAULTS.get(key, False)))
+
+
+def group_of_umo(umo: str) -> str:
+    """Pull the group id out of ``qq:GroupMessage:<gid>`` (empty for private)."""
+    try:
+        parts = str(umo).split(":")
+        return parts[2] if len(parts) > 2 and parts[1] == "GroupMessage" else ""
+    except Exception:  # noqa: BLE001
+        return ""
 DEFAULT_IDLE_MIN = 90
 WATER_COOLDOWN = 40 * 60
 ACTIVE_HOURS = range(9, 24)
@@ -1343,6 +1406,10 @@ class Main(star.Star):
         else:
             logger.warning("[peer] 人格为空，未覆盖数据库 system_prompt（现有设置保持不变）")
         self._watch_task: asyncio.Task | None = None
+        # 进群提醒注册标记。不能用 getattr(bot, "_peer_welcome_hooked") 判断：
+        # aiocqhttp 的 AsyncApi.__getattr__ 会把任意属性访问动态转成 OneBot API
+        # 调用器（truthy），导致「已注册」假象永远跳过注册（踩过，2026-11-20）。
+        self._welcome_hooked = False
         self._last_water: dict[str, float] = {}
         self._busy: dict[str, float] = {}
         self._last_done: dict[str, float] = {}
@@ -1391,8 +1458,14 @@ class Main(star.Star):
                 event.stop_event()
                 return
 
-        # @ / 唤醒类消息：一律放行，交给 AstrBot 的会话锁排队
+        # @ / 唤醒类消息：受群接话开关管——关掉的群（骰子娘模式）不进大模型。
+        # 斜线指令和关键词触发在更早的 gate/CMD_BAND 层已经处理完，到不了这里。
+        gid = group_of_umo(umo)
         if getattr(event, "is_at_or_wake_command", False):
+            if gid and not group_flag(gid, "reply_at"):
+                logger.info(f"[peer] reply_at off in {gid}, dropped: {text[:30]}")
+                event.stop_event()
+                return
             logger.info(f"[peer] at-mention queued: {text[:30]}")
             return
 
@@ -1432,10 +1505,57 @@ class Main(star.Star):
 
     @filter.on_astrbot_loaded()
     async def start_watch(self) -> None:
-        """Start the idle-group watcher once AstrBot is up."""
+        """Start the idle-group watcher and welcome listener once AstrBot is up."""
         if self._watch_task is None:
             self._watch_task = asyncio.create_task(self._idle_loop())
             logger.info("[peer] idle watcher started")
+        self._register_welcome()
+
+    def _register_welcome(self) -> None:
+        """Hook group_increase notices on the aiocqhttp bot for welcomes.
+
+        开关在 access 的 group_flags.json（/进群提醒 开/关，默认关）；拿不到
+        bot 实例就跳过，不影响 peer 其他功能。
+        """
+        try:
+            platform = self.context.get_platform("aiocqhttp")
+            bot = getattr(platform, "bot", None)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[peer] welcome skip (no platform): {e}")
+            return
+        if bot is None:
+            logger.warning("[peer] welcome skip: aiocqhttp bot not ready yet")
+            return
+        if self._welcome_hooked:
+            return
+
+        @bot.on_notice()
+        async def _welcome_notice(ev) -> None:  # noqa: ANN001 - aiocqhttp Event
+            try:
+                ev = dict(ev)
+                if ev.get("notice_type") != "group_increase":
+                    return
+                gid = str(ev.get("group_id") or "")
+                uid = str(ev.get("user_id") or "")
+                self_id = str(ev.get("self_id") or "")
+                if not gid or not uid or uid == self_id:
+                    return  # 自己进群/退群不管
+                if not group_flag(gid, "welcome"):
+                    return
+                await bot.call_action(
+                    "send_group_msg",
+                    group_id=int(gid),
+                    message=[
+                        {"type": "at", "data": {"qq": uid}},
+                        {"type": "text", "data": {"text": "\n" + WELCOME_TEXT}},
+                    ],
+                )
+                logger.info(f"[peer] welcomed {uid} in {gid}")
+            except Exception as e:  # noqa: BLE001 - welcome never kills anything
+                logger.warning(f"[peer] welcome failed: {e}")
+
+        self._welcome_hooked = True
+        logger.info("[peer] welcome listener registered")
 
     async def _idle_loop(self) -> None:
         """Every minute, water a group that has gone quiet."""
@@ -1456,6 +1576,8 @@ class Main(star.Star):
         for group, last in _group_activity().items():
             if group not in allowed:
                 continue
+            if not group_flag(group, "proactive"):
+                continue  # 群主动发言关（骰子娘模式），不冒泡
             conf = overrides.get(group, {})
             if not conf.get("enabled", True):
                 continue
