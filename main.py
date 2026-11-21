@@ -1,4 +1,4 @@
-"""Peer behaviour: persona, silence on non-answers, and idle-group chatter.
+"""BasicZ: group-chat baseline behaviour — persona, silence-on-no-answer, idle warmup, guards.
 
 The persona lives in ``D:\\QQNTBOT\\data\\persona.json`` so the dashboard can
 edit it without touching Python source. Missing file falls back to the
@@ -26,13 +26,13 @@ from astrbot.core.message.message_event_result import MessageChain
 
 # 指令自声明（插件开发规范要求，见 docs/PLUGIN-DEV.md）：本插件无斜线指令
 DECLARED_COMMANDS: dict[str, tuple[str, str]] = {}
-DECLARED_BEHAVIOR = "无斜线指令：群聊人格回复仲裁、注入防护、刷屏拦截、闲时主动搭话（全被动行为）"
+DECLARED_BEHAVIOR = "无斜线指令：群聊人格回复仲裁、注入防护、刷屏拦截、冷场热群话（全被动行为）"
 
 DB = Path(r"D:\QQNTBOT\apps\AstrBot\data\data_v4.db")
 PERSONA_FILE = Path(r"D:\QQNTBOT\data\persona.json")
 
 # 进群提醒文本：权威定义在 access 插件（开关指令的「状态」预览同一份），
-# 单拎 peer 时用这里的兜底文案。
+# 单拎 basicZ 时用这里的兜底文案。
 try:
     import sys as _sys
 
@@ -68,12 +68,25 @@ WATER_FILE = Path(r"D:\QQNTBOT\data\water.json")
 
 # 群开关文件（access 插件的 /群聊 /进群提醒 写入，本插件只读）。
 # 文件不存在 = 一切照旧（单拎兼容），与 access 的默认值保持一致：
-# proactive 默认关、reply_at 默认开、welcome 默认关。
+# auto_chat(主动冒泡) 默认开、warmup(热群) 默认关、welcome(进群提醒) 默认关。
+# 旧键 reply_at/proactive 做兼容映射，落盘只用新键。
 GROUP_FLAGS_FILE = Path(
     r"D:\QQNTBOT\apps\AstrBot\data\plugins\astrbot_plugin_access\group_flags.json"
 )
-GROUP_FLAG_DEFAULTS = {"proactive": False, "reply_at": True, "welcome": False}
+GROUP_FLAG_DEFAULTS = {"auto_chat": True, "warmup": False, "welcome": False}
+FLAG_KEY_ALIAS = {"reply_at": "auto_chat", "proactive": "warmup"}
 _flags_cache: dict = {"mtime": 0.0, "data": None}
+
+
+def _normalize_flag_entry(conf: dict) -> dict:
+    entry = dict(GROUP_FLAG_DEFAULTS)
+    for key in GROUP_FLAG_DEFAULTS:
+        if key in conf:
+            entry[key] = bool(conf[key])
+    for old, new in FLAG_KEY_ALIAS.items():
+        if new not in conf and old in conf:
+            entry[new] = bool(conf[old])
+    return entry
 
 
 def load_group_flags() -> dict[str, dict]:
@@ -92,15 +105,16 @@ def load_group_flags() -> dict[str, dict]:
     groups: dict[str, dict] = {}
     for gid, conf in (raw.get("groups") or {}).items():
         if isinstance(conf, dict):
-            entry = dict(GROUP_FLAG_DEFAULTS)
-            entry.update({k: bool(v) for k, v in conf.items() if k in GROUP_FLAG_DEFAULTS})
-            groups[str(gid)] = entry
+            groups[str(gid)] = _normalize_flag_entry(conf)
     _flags_cache = {"mtime": stat.st_mtime, "data": groups}
     return groups
 
 
 def group_flag(gid: str, key: str) -> bool:
-    """One switch for one group; unconfigured groups fall back to defaults."""
+    """One switch for one group; unconfigured groups fall back to defaults.
+
+    Normalized entries already carry canonical keys plus alias fallback, so
+    callers only ever pass new names (auto_chat / warmup / welcome)."""
     conf = load_group_flags().get(str(gid)) or {}
     return bool(conf.get(key, GROUP_FLAG_DEFAULTS.get(key, False)))
 
@@ -184,16 +198,16 @@ def load_persona() -> str:
     空串，由调用方跳过覆盖，绝不用任何默认值替用户做人设决定。
     """
     if not PERSONA_FILE.exists():
-        logger.warning(f"[peer] {PERSONA_FILE.name} 不存在，跳过人格覆盖")
+        logger.warning(f"[basicz] {PERSONA_FILE.name} 不存在，跳过人格覆盖")
         return ""
     try:
         data = json.loads(PERSONA_FILE.read_text(encoding="utf-8"))
         text = str(data.get("text") or "").strip()
     except (json.JSONDecodeError, OSError) as exc:
-        logger.warning(f"[peer] persona.json 读不了，跳过人格覆盖: {exc}")
+        logger.warning(f"[basicz] persona.json 读不了，跳过人格覆盖: {exc}")
         return ""
     if not text:
-        logger.warning(f"[peer] {PERSONA_FILE.name} 里没有 text，跳过人格覆盖")
+        logger.warning(f"[basicz] {PERSONA_FILE.name} 里没有 text，跳过人格覆盖")
     return text
 
 
@@ -614,7 +628,7 @@ async def _pin_image(url: str) -> str:
                 resp.raise_for_status()
             raw = resp.content
         except Exception as exc:  # noqa: BLE001 - pinning is best effort
-            logger.debug(f"[peer] pin download failed: {exc}")
+            logger.debug(f"[basicz] pin download failed: {exc}")
             return url
     else:
         try:
@@ -645,7 +659,7 @@ async def _pin_image(url: str) -> str:
         _pin_gc()
         return str(pinned)
     except OSError as exc:
-        logger.debug(f"[peer] pin write failed: {exc}")
+        logger.debug(f"[basicz] pin write failed: {exc}")
         return url
 
 
@@ -697,7 +711,7 @@ def _meme_category_desc(category: str) -> str:
             }
             _MEME_DESC["mtime"] = stat.st_mtime
     except Exception as exc:  # noqa: BLE001 - 包坏了不能挡住发图
-        logger.debug(f"[peer] meme manifest unreadable: {exc}")
+        logger.debug(f"[basicz] meme manifest unreadable: {exc}")
         return ""
     return _MEME_DESC["data"].get(category, "")
 
@@ -787,7 +801,7 @@ async def _upgrade_recent_image(event, req, rec: dict) -> None:
             (req.prompt or "")
             + "\n[图片] 识图关着，看不到刚才那张图的细节，别猜，直说看不了"
         )
-        logger.info(f"[peer] detail upgrade skipped (vision off): {key}")
+        logger.info(f"[basicz] detail upgrade skipped (vision off): {key}")
         return
     if _third_party_mode():
         data = _to_data_url(url)
@@ -796,7 +810,7 @@ async def _upgrade_recent_image(event, req, rec: dict) -> None:
                 (req.prompt or "")
                 + "\n[图片] 刚才那张图取不到了，别编画面细节"
             )
-            logger.warning(f"[peer] detail upgrade: image unreadable {key}")
+            logger.warning(f"[basicz] detail upgrade: image unreadable {key}")
             return
         req.image_urls = [data]
         req.prompt = (
@@ -805,7 +819,7 @@ async def _upgrade_recent_image(event, req, rec: dict) -> None:
             "别只照搬前面的大概描述"
         )
         rec["detail_at"] = time.time()
-        logger.info(f"[peer] detail upgrade: original image sent ({key})")
+        logger.info(f"[basicz] detail upgrade: original image sent ({key})")
         return
     # 本地模式：主模型不吃图，让本地 VL 出详细档
     detail = await _caption_local(url, detail=True)
@@ -814,19 +828,19 @@ async def _upgrade_recent_image(event, req, rec: dict) -> None:
         if hit:
             req.prompt = (req.prompt or "") + "\n[刚才那张图·仔细看] " + hit
             rec["brief"] = hit
-            logger.info(f"[peer] detail upgrade: reused cached caption ({key})")
+            logger.info(f"[basicz] detail upgrade: reused cached caption ({key})")
         else:
             req.prompt = (
                 (req.prompt or "")
                 + "\n[图片] 本地读图没起来，看不了细节，别猜"
             )
-            logger.warning(f"[peer] detail upgrade: local VL down ({key})")
+            logger.warning(f"[basicz] detail upgrade: local VL down ({key})")
             return
     else:
         req.prompt = (req.prompt or "") + "\n[刚才那张图·仔细看] " + detail
         # 详细档写回记忆：之后同图再问就免费复用，不用重跑 VL
         rec["brief"] = detail
-        logger.info(f"[peer] detail upgrade: local VL caption ({key})")
+        logger.info(f"[basicz] detail upgrade: local VL caption ({key})")
     rec["detail_at"] = time.time()
 
 
@@ -957,7 +971,7 @@ async def _caption_local(url: str, detail: bool = False) -> str:
             text = (resp.json()["choices"][0]["message"].get("content") or "").strip()
         return text[:cap] if text else "（读图能力不可用）"
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"[peer] local VL failed: {exc}")
+        logger.warning(f"[basicz] local VL failed: {exc}")
         return "（读图能力不可用）"
 
 
@@ -1059,7 +1073,7 @@ def _vision_flush() -> None:
             )
             con.commit()
     except Exception as exc:  # noqa: BLE001 - 计数丢了不影响读图
-        logger.debug(f"[peer] vision cache flush failed: {exc}")
+        logger.debug(f"[basicz] vision cache flush failed: {exc}")
 
 
 def _vision_touch(sha: str) -> None:
@@ -1096,7 +1110,7 @@ def _vision_lookup(sha: str) -> str:
                     "SELECT caption FROM captions WHERE sha = ?", (sha,)
                 ).fetchone()
         except Exception as exc:  # noqa: BLE001 - 缓存坏了不能挡读图
-            logger.debug(f"[peer] vision cache read failed: {exc}")
+            logger.debug(f"[basicz] vision cache read failed: {exc}")
             return ""
         if not row:
             return ""
@@ -1129,7 +1143,7 @@ def _vision_peek(sha: str) -> str:
                 "SELECT caption FROM captions WHERE sha = ?", (sha,)
             ).fetchone()
     except Exception as exc:  # noqa: BLE001
-        logger.debug(f"[peer] vision cache read failed: {exc}")
+        logger.debug(f"[basicz] vision cache read failed: {exc}")
         return ""
     if not row:
         return ""
@@ -1211,7 +1225,7 @@ def _split_images(
             left -= len(cached) + 3
         else:
             if cached:
-                logger.info(f"[peer] caption shaky, sending raw image: {cached[:30]}")
+                logger.info(f"[basicz] caption shaky, sending raw image: {cached[:30]}")
             unseen.append((url, sha, len(raw)))
     return notes, unseen, left
 
@@ -1337,7 +1351,7 @@ def _vision_store(sha: str, caption: str, size: int) -> None:
             )
             con.commit()
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"[peer] vision cache write failed: {exc}")
+        logger.warning(f"[basicz] vision cache write failed: {exc}")
         return
     if len(_VISION_MEM) >= _VISION_MEM_MAX:
         _VISION_MEM.pop(next(iter(_VISION_MEM)), None)
@@ -1366,7 +1380,7 @@ def _vision_gc() -> int:
             con.commit()
             return cur.rowcount or 0
     except Exception as exc:  # noqa: BLE001
-        logger.debug(f"[peer] vision cache gc failed: {exc}")
+        logger.debug(f"[basicz] vision cache gc failed: {exc}")
         return 0
 
 
@@ -1395,7 +1409,7 @@ async def _caption_cached(url: str) -> tuple[str, bool]:
         _VISION_GC_AT = now
         removed = await asyncio.to_thread(_vision_gc)
         if removed:
-            logger.info(f"[peer] vision cache gc removed {removed} stale caption(s)")
+            logger.info(f"[basicz] vision cache gc removed {removed} stale caption(s)")
     return caption, False
 
 
@@ -1433,9 +1447,9 @@ class Main(star.Star):
         text = load_persona()
         if text:
             chars = _apply_persona(text)
-            logger.info(f"[peer] persona applied ({chars} chars) from {PERSONA_FILE.name}")
+            logger.info(f"[basicz] persona applied ({chars} chars) from {PERSONA_FILE.name}")
         else:
-            logger.warning("[peer] 人格为空，未覆盖数据库 system_prompt（现有设置保持不变）")
+            logger.warning("[basicz] 人格为空，未覆盖数据库 system_prompt（现有设置保持不变）")
         self._watch_task: asyncio.Task | None = None
         # 进群提醒注册标记。不能用 getattr(bot, "_peer_welcome_hooked") 判断：
         # aiocqhttp 的 AsyncApi.__getattr__ 会把任意属性访问动态转成 OneBot API
@@ -1473,13 +1487,13 @@ class Main(star.Star):
         elif isinstance(raw_msg, str):
             raw_text = raw_msg
         if raw_text.lstrip().startswith(("/", "／")) or text.startswith(("/", "／")):
-            logger.info(f"[peer] slash command not sent to model: {text[:30]}")
+            logger.info(f"[basicz] slash command not sent to model: {text[:30]}")
             event.stop_event()
             return
 
         if INJECTION.search(text):
             self._injected += 1
-            logger.warning(f"[peer] injection blocked: {text[:60]}")
+            logger.warning(f"[basicz] injection blocked: {text[:60]}")
             event.stop_event()
             return
 
@@ -1489,35 +1503,35 @@ class Main(star.Star):
                 event.stop_event()
                 return
 
-        # @ / 唤醒类消息：受群接话开关管——关掉的群（骰子娘模式）不进大模型。
+        # @ / 唤醒类消息：受主动冒泡开关管——关掉的群（骰子娘模式）不进大模型。
         # 斜线指令和关键词触发在更早的 gate/CMD_BAND 层已经处理完，到不了这里。
         gid = group_of_umo(umo)
         if getattr(event, "is_at_or_wake_command", False):
-            if gid and not group_flag(gid, "reply_at"):
-                logger.info(f"[peer] reply_at off in {gid}, dropped: {text[:30]}")
+            if gid and not group_flag(gid, "auto_chat"):
+                logger.info(f"[basicz] auto_chat off in {gid}, dropped: {text[:30]}")
                 event.stop_event()
                 return
-            logger.info(f"[peer] at-mention queued: {text[:30]}")
+            logger.info(f"[basicz] at-mention queued: {text[:30]}")
             return
 
         started = self._busy.get(umo)
         if started is not None:
             if now - started < BUSY_TIMEOUT:
                 self._blocked += 1
-                logger.info(f"[peer] busy, dropped: {text[:30]}")
+                logger.info(f"[basicz] busy, dropped: {text[:30]}")
                 event.stop_event()
                 return
             self._release(umo)  # 卡死超时，视为空闲
 
         if now - self._last_done.get(umo, 0.0) < COOLDOWN_SECONDS:
             self._blocked += 1
-            logger.info(f"[peer] cooldown ({int(now - self._last_done[umo])}s), dropped")
+            logger.info(f"[basicz] cooldown ({int(now - self._last_done[umo])}s), dropped")
             event.stop_event()
             return
 
         if self._active >= MAX_CONCURRENT:
             self._blocked += 1
-            logger.info(f"[peer] global cap {MAX_CONCURRENT} reached, dropped")
+            logger.info(f"[basicz] global cap {MAX_CONCURRENT} reached, dropped")
             event.stop_event()
             return
 
@@ -1539,7 +1553,7 @@ class Main(star.Star):
         """Start the idle-group watcher and welcome listener once AstrBot is up."""
         if self._watch_task is None:
             self._watch_task = asyncio.create_task(self._idle_loop())
-            logger.info("[peer] idle watcher started")
+            logger.info("[basicz] idle watcher started")
         self._register_welcome()
 
     def _register_welcome(self) -> None:
@@ -1552,10 +1566,10 @@ class Main(star.Star):
             platform = self.context.get_platform("aiocqhttp")
             bot = getattr(platform, "bot", None)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[peer] welcome skip (no platform): {e}")
+            logger.warning(f"[basicz] welcome skip (no platform): {e}")
             return
         if bot is None:
-            logger.warning("[peer] welcome skip: aiocqhttp bot not ready yet")
+            logger.warning("[basicz] welcome skip: aiocqhttp bot not ready yet")
             return
         if self._welcome_hooked:
             return
@@ -1581,12 +1595,12 @@ class Main(star.Star):
                         {"type": "text", "data": {"text": "\n" + WELCOME_TEXT}},
                     ],
                 )
-                logger.info(f"[peer] welcomed {uid} in {gid}")
+                logger.info(f"[basicz] welcomed {uid} in {gid}")
             except Exception as e:  # noqa: BLE001 - welcome never kills anything
-                logger.warning(f"[peer] welcome failed: {e}")
+                logger.warning(f"[basicz] welcome failed: {e}")
 
         self._welcome_hooked = True
-        logger.info("[peer] welcome listener registered")
+        logger.info("[basicz] welcome listener registered")
 
     async def _idle_loop(self) -> None:
         """Every minute, water a group that has gone quiet."""
@@ -1595,7 +1609,7 @@ class Main(star.Star):
             try:
                 await self._maybe_water()
             except Exception as exc:  # noqa: BLE001 - never kill the loop
-                logger.warning(f"[peer] idle watcher error: {exc}")
+                logger.warning(f"[basicz] idle watcher error: {exc}")
 
     async def _maybe_water(self) -> None:
         """Send one opener to each allowlisted group that has been idle."""
@@ -1607,11 +1621,11 @@ class Main(star.Star):
         for group, last in _group_activity().items():
             if group not in allowed:
                 continue
-            if not group_flag(group, "proactive"):
-                continue  # 群主动发言关（骰子娘模式），不冒泡
+            if not group_flag(group, "warmup"):
+                continue  # 群热群关，不发冷场暖场话（单一开关：group_flags.warmup）
             conf = overrides.get(group, {})
-            if not conf.get("enabled", True):
-                continue
+            # water.json 的 enabled 已废弃（2026-11-21）：热群开关统一由
+            # group_flags.warmup 管，这里只读 idle_min 空闲时长，避免双开关打架。
             idle_limit = int(conf.get("idle_min", DEFAULT_IDLE_MIN)) * 60
             if now - last < idle_limit:
                 continue
@@ -1623,10 +1637,10 @@ class Main(star.Star):
                 await self.context.send_message(umo, MessageChain([Plain(line)]))
                 self._last_water[group] = now
                 logger.info(
-                    f"[peer] watered {group} (idle {int((now - last) / 60)}min): {line}"
+                    f"[basicz] watered {group} (idle {int((now - last) / 60)}min): {line}"
                 )
             except Exception as exc:  # noqa: BLE001
-                logger.warning(f"[peer] water failed for {group}: {exc}")
+                logger.warning(f"[basicz] water failed for {group}: {exc}")
 
     async def _send_random_meme(self, event: AstrMessageEvent, text: str) -> bool:
         """Send a random sticker from the furry pack, bypassing the model.
@@ -1640,7 +1654,7 @@ class Main(star.Star):
         """
         memes = MEME_ROOT / "furry" / "memes"
         if not memes.is_dir():
-            logger.warning(f"[peer] meme pack missing: {memes}")
+            logger.warning(f"[basicz] meme pack missing: {memes}")
             return False
         category = ""
         for words, name in MEME_CATEGORY_HINTS:
@@ -1653,12 +1667,12 @@ class Main(star.Star):
         if not pool:
             pool = [p for p in memes.rglob("*") if p.is_file()]
         if not pool:
-            logger.warning("[peer] meme pack empty")
+            logger.warning("[basicz] meme pack empty")
             return False
         chosen = random.choice(pool)
         try:
             await event.send(event.image_result(str(chosen)))
-            logger.info(f"[peer] sent meme {chosen.parent.name}/{chosen.name}")
+            logger.info(f"[basicz] sent meme {chosen.parent.name}/{chosen.name}")
             desc = _meme_category_desc(chosen.parent.name)
             brief, sha = _image_brief(
                 str(chosen), desc or f"一张「{chosen.parent.name}」类表情包"
@@ -1666,7 +1680,7 @@ class Main(star.Star):
             _remember_image(_event_key(event), str(chosen), brief, sha, sent_by="bot")
             return True
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[peer] meme send failed: {exc}")
+            logger.warning(f"[basicz] meme send failed: {exc}")
             return False
 
     @staticmethod
@@ -1714,11 +1728,11 @@ class Main(star.Star):
             # 只碰到一个弱词（比如「烦」「香」）就配图，多半和语气对不上。
             # 以前没命中时还会从全部 86 张里随机抓一张，违和感主要来自这里。
             if top_score < 2:
-                logger.info(f"[peer] meme skipped, weak mood {top_name}={top_score}")
+                logger.info(f"[basicz] meme skipped, weak mood {top_name}={top_score}")
                 return
             if (memes / top_name).is_dir():
                 category = top_name
-            logger.info(f"[peer] meme mood {category} scores={dict(best[:3])}")
+            logger.info(f"[basicz] meme mood {category} scores={dict(best[:3])}")
         else:
             return
         pool = [p for p in (memes / category).iterdir() if p.is_file()] if category else []
@@ -1727,7 +1741,7 @@ class Main(star.Star):
         chosen = random.choice(pool)
         try:
             result.chain.append(Image.fromFileSystem(str(chosen)))
-            logger.info(f"[peer] attached meme {chosen.parent.name}/{chosen.name}")
+            logger.info(f"[basicz] attached meme {chosen.parent.name}/{chosen.name}")
             desc = _meme_category_desc(chosen.parent.name)
             brief, sha = _image_brief(
                 str(chosen), desc or f"一张「{chosen.parent.name}」类表情包"
@@ -1737,7 +1751,7 @@ class Main(star.Star):
                     _event_key(event), str(chosen), brief, sha, sent_by="bot"
                 )
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[peer] attach meme failed: {exc}")
+            logger.warning(f"[basicz] attach meme failed: {exc}")
 
     @filter.on_llm_request()
     async def log_system_prompt(self, event: AstrMessageEvent, req) -> None:
@@ -1756,7 +1770,7 @@ class Main(star.Star):
                     "你看不到里面的内容，不要假装知道或猜测它写了什么；"
                     "对方没把内容打出来就如实说你看不到转发内容]"
                 )
-                logger.info("[peer] forward placeholder note added")
+                logger.info("[basicz] forward placeholder note added")
         except Exception:  # noqa: BLE001 - Forward 组件缺失时跳过
             pass
         if req.image_urls:
@@ -1767,7 +1781,7 @@ class Main(star.Star):
             _brief, _sha = _image_brief(pinned)
             _remember_image(recent_key, pinned, _brief, _sha)
             if not _third_party_mode():
-                logger.info(f"[peer] stripped {len(req.image_urls)} image(s) from request")
+                logger.info(f"[basicz] stripped {len(req.image_urls)} image(s) from request")
                 req.image_urls = []
             else:
                 mode = _vision_mode()
@@ -1782,7 +1796,7 @@ class Main(star.Star):
                             (req.prompt or "")
                             + "\n[图片] 识图关着，你看不到图，别猜内容，可以直说不看"
                         )
-                    logger.info(f"[peer] vision skipped ({mode}): {len(req.image_urls)} image(s)")
+                    logger.info(f"[basicz] vision skipped ({mode}): {len(req.image_urls)} image(s)")
                     req.image_urls = []
                 elif mode == "local":
                     # 本地 VL 转文字，第三方模型完全接触不到图片
@@ -1807,7 +1821,7 @@ class Main(star.Star):
                             "（太多/太长），不想看就直说，别猜内容"
                         )
                     logger.info(
-                        f"[peer] local VL captioned {len(captions)} image(s), "
+                        f"[basicz] local VL captioned {len(captions)} image(s), "
                         f"{hits} from cache, {dropped} dropped, "
                         f"vision budget left {budget}"
                     )
@@ -1827,7 +1841,7 @@ class Main(star.Star):
                         )
                         if waited >= 0.5:
                             logger.info(
-                                f"[peer] waited {waited:.1f}s for background caption"
+                                f"[basicz] waited {waited:.1f}s for background caption"
                             )
                             notes, unseen, budget = _split_images(req.image_urls)
 
@@ -1835,7 +1849,7 @@ class Main(star.Star):
                     dropped = total - len(notes) - sent
                     if len(unseen) > VISION_MAX_IMAGES:
                         logger.info(
-                            f"[peer] vision capped: {len(unseen)} unseen -> "
+                            f"[basicz] vision capped: {len(unseen)} unseen -> "
                             f"{VISION_MAX_IMAGES} sent"
                         )
                     if notes:
@@ -1860,7 +1874,7 @@ class Main(star.Star):
                     dropped += unreadable
                     if unreadable:
                         logger.warning(
-                            f"[peer] {unreadable} image(s) unreadable "
+                            f"[basicz] {unreadable} image(s) unreadable "
                             "(local path), dropped from request"
                         )
                     if dropped > 0:
@@ -1872,7 +1886,7 @@ class Main(star.Star):
                             "（太多/太长），不想看就直说，别猜内容"
                         )
                     logger.info(
-                        f"[peer] third-party vision: {len(notes)} from cache, "
+                        f"[basicz] third-party vision: {len(notes)} from cache, "
                         f"{sent} sent to model, {dropped} dropped, "
                         f"caption budget left {budget}"
                     )
@@ -1903,12 +1917,12 @@ class Main(star.Star):
                 if cooling:
                     # 刚仔细看过同一张图，模型上下文里已有上一条带图回复，
                     # 别反复把原图塞进来白烧 token
-                    logger.info(f"[peer] follow-up detail in cooldown: {recent_key}")
+                    logger.info(f"[basicz] follow-up detail in cooldown: {recent_key}")
                 elif _wants_image_detail(event, event.message_str or ""):
                     await _upgrade_recent_image(event, req, rec)
-                    logger.info(f"[peer] follow-up detail upgrade: {recent_key}")
+                    logger.info(f"[basicz] follow-up detail upgrade: {recent_key}")
                 else:
-                    logger.info(f"[peer] follow-up brief reused: {recent_key}")
+                    logger.info(f"[basicz] follow-up brief reused: {recent_key}")
 
         # 群聊里给当前消息标上说话人，和历史块的格式保持一致
         group_id = str(event.get_group_id() or "")
@@ -1925,7 +1939,7 @@ class Main(star.Star):
             return
         self._prompt_logged = True
         head = (req.system_prompt or "").replace("\n", " ")[:260]
-        logger.info(f"[peer] system prompt head: {head}")
+        logger.info(f"[basicz] system prompt head: {head}")
 
     @filter.on_decorating_result()
     async def decorate_result(self, event: AstrMessageEvent) -> None:
@@ -1943,7 +1957,7 @@ class Main(star.Star):
             return
         # 模型报错时 AstrBot 会把 None 当字符串发出去，这里直接拦掉
         if text.lower() in ("none", "null", "nan", ""):
-            logger.info("[peer] dropped empty/None reply")
+            logger.info("[basicz] dropped empty/None reply")
             result.chain.clear()
             event.stop_event()
             return
@@ -1959,7 +1973,7 @@ class Main(star.Star):
             try:
                 pattern = re.compile(rule["pattern"])
             except re.error as exc:
-                logger.warning(f"[peer] bad regex {rule['pattern']}: {exc}")
+                logger.warning(f"[basicz] bad regex {rule['pattern']}: {exc}")
                 continue
             for comp in result.chain:
                 inner = getattr(comp, "text", None)

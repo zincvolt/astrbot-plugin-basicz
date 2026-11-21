@@ -1,4 +1,4 @@
-name: astrbot_plugin_peer
-desc: 像群友一样聊天的人格与行为插件（人格可配置、发言闸门、表情包、水群）。整套 QQ 机器人方案主仓库：github.com/zincvolt/QQNTbotBUTafter261101
+name: astrbot_plugin_basicz
+desc: 群聊基础行为层（basicZ）：人格渲染、发言闸门（要不要开口）、注入防护、刷屏拦截、冷场热群、表情后处理、读图闸。无斜线指令，全被动行为；主动接话由框架判官决定。整套 QQ 机器人方案主仓库：github.com/zincvolt/QQNTbotBUTafter261101
 author: local
-version: 1.2.1
+version: 2.0.0
