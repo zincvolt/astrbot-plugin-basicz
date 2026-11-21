@@ -1,4 +1,4 @@
 name: astrbot_plugin_peer
 desc: 像群友一样聊天的人格与行为插件（人格可配置、发言闸门、表情包、水群）。整套 QQ 机器人方案主仓库：github.com/zincvolt/QQNTbotBUTafter261101
 author: local
-version: 1.2.0
+version: 1.2.1

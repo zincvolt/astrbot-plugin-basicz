@@ -455,7 +455,7 @@ VISION_HINTS = (
     "这张图", "这个图", "这图", "图片", "图上", "图里", "图片里", "图是",
     # 在问内容
     "这是什么", "什么字", "写的啥", "写了什么", "写的是啥", "画的啥",
-    "啥图", "什么图",
+    "啥图", "什么图", "啥玩意", "什么东西", "啥东西",
     "这啥", "是啥", "啥意思", "什么意思", "长啥样", "什么样",
     "识别", "翻译", "描述一下", "描述下",
     # 让它评价/打分这类也是冲着图来的（「评价一下」不带「看」字）
@@ -1156,10 +1156,39 @@ def _image_brief(url: str, fallback: str = "") -> tuple[str, str]:
     return brief, sha
 
 
+def _caption_shaky(text: str) -> bool:
+    """Heuristic: is this cached caption too low-quality to trust as the image?
+
+    与 vision_context.caption_shaky 同一套规则（两边独立部署，各自实现）：
+    抓 OCR 时代的纯文字抄写（「ARK RHODES ISLAND…」只有 logo 文字）和
+    表情库占位文案。缓存描述若不可信，这张图按「没描述」处理——
+    把原图发给模型兜底，只贵一次；好描述继续省 token 不发原图。
+
+    Args:
+        text: Cached caption text.
+
+    Returns:
+        True when the caption should not be trusted.
+    """
+    if not text or not text.strip():
+        return True
+    text = text.strip()
+    if len(text) < 10:
+        return True
+    if any(word in text for word in ("暂存", "未归类", "未分类")):
+        return True
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    return cjk / len(text) < 0.3
+
+
 def _split_images(
     urls: list[str], budget: int = VISION_PROMPT_CHARS
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str, int]], int]:
     """Sort images into「已有描述」和「待看图」两堆。
+
+    缓存命中的描述先过质量筛查（``_caption_shaky``）：OCR 时代的纯文字
+    抄写、占位文案这类低质描述不可信，对应的图改按「没描述」处理，
+    走原图发送兜底——描述错得离谱比多花一千 token 更伤。
 
     Args:
         urls: Image payloads on the request.
@@ -1175,12 +1204,14 @@ def _split_images(
     for url in urls:
         raw, sha = _image_blob(url)
         cached = _vision_peek(sha) if sha else ""
-        if cached:
+        if cached and not _caption_shaky(cached):
             if left - len(cached) < 0:
                 continue
             notes.append((cached, sha))
             left -= len(cached) + 3
         else:
+            if cached:
+                logger.info(f"[peer] caption shaky, sending raw image: {cached[:30]}")
             unseen.append((url, sha, len(raw)))
     return notes, unseen, left
 
@@ -1714,6 +1745,20 @@ class Main(star.Star):
         # 主模型是纯文本的：把图片转成文字，别让 9B 收到 image 参数（会 500）
         # 本地 9B 不支持图片输入，会 500；第三方 DeepSeek 支持，但只在必要时读图
         recent_key = _event_key(event)
+        # 合并转发的内容模型看不见（框架只渲染成 [转发消息] 占位）：明说，
+        # 别让它对看不见的东西装懂或瞎猜。零成本纯提示，不做 get_forward_msg
+        # 拉内容（要花 token 且转发里可能是几十条长文）。
+        try:
+            from astrbot.api.message_components import Forward
+            if any(isinstance(m, Forward) for m in event.get_messages()):
+                req.system_prompt = (req.system_prompt or "") + (
+                    "\n[这条消息里含「转发消息」（合并转发的聊天记录），"
+                    "你看不到里面的内容，不要假装知道或猜测它写了什么；"
+                    "对方没把内容打出来就如实说你看不到转发内容]"
+                )
+                logger.info("[peer] forward placeholder note added")
+        except Exception:  # noqa: BLE001 - Forward 组件缺失时跳过
+            pass
         if req.image_urls:
             # 记住本轮这张图。「你这个表情包里怎么是小狗」这类跨轮追问
             # 本轮不带图，只有靠这条记录才能找回原图和大概描述。
