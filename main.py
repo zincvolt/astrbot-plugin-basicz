@@ -479,7 +479,8 @@ VISION_HINTS = (
 # 读图预算单列，不跟聊天共用。原图一张 1000~2000 token，描述一句约 30 token。
 VISION_MAX_IMAGES = 2        # 一次请求最多放进几张原图
 VISION_PROMPT_CHARS = 800    # 图片描述最多占多少字（截图类描述更长）
-VISION_WAIT_SECONDS = 4.0    # 有图时肯多等几秒后台识图，换来不发原图
+VISION_WAIT_SECONDS = 9.0    # 有图才等：盖住云端识图全链路（本地空试~4s + flash~2s + 抖动）
+                             # 只在「本轮带图且无缓存」时生效，没图/命中缓存都 0 等待
 VISION_POLL_SECONDS = 0.25
 # 截图/长图要给足字数：QQ空间截图、聊天记录一张就一大段文字，
 # 90 字截断等于把内容全丢了
@@ -1298,9 +1299,14 @@ async def _wait_for_captions(
 ) -> float:
     """Give the background captioner a few seconds before sending raw images.
 
-    Sending an image costs 1000~2000 tokens; waiting ~2 s for the caption costs
-    nothing and usually wins. Bounded by ``VISION_WAIT_SECONDS`` and skipped
-    entirely when the captioner is not watching this chat (group or private).
+    有图才等：本函数只在「本轮消息带图、且这批图没有可用缓存」时被调用。
+    无图 / 命中缓存的路径根本不会走到这里，所以把窗口放宽到
+    ``VISION_WAIT_SECONDS`` 不会拖慢普通聊天。
+
+    等待的产出是让后台识图把描述写进共享缓存。判定用「任一命中」而非
+    「全部命中」：一次发多张图时，识图是逐张串行补描述的，等全部命中
+    会让先完成的描述也被拖住；任一命中就返回，配合调用方重新 split，
+    已完成的走文字、没完成的走原图，各自最优。
 
     Args:
         unseen: ``(url, sha, size)`` triples with no cached caption yet.
@@ -1325,10 +1331,17 @@ async def _wait_for_captions(
     start = time.time()
     deadline = start + VISION_WAIT_SECONDS
     while time.time() < deadline:
-        if all(_vision_peek(sha) for sha in shas):
+        # 任一命中即可：让已完成的描述先用上，不陪没完成的干等
+        if any(_vision_peek(sha) for sha in shas):
             break
         await asyncio.sleep(VISION_POLL_SECONDS)
-    return time.time() - start
+    waited = time.time() - start
+    if waited >= 0.5:
+        hit = sum(1 for sha in shas if _vision_peek(sha))
+        logger.info(
+            f"[basicz] caption wait {waited:.1f}s: {hit}/{len(shas)} landed"
+        )
+    return waited
 
 
 def _vision_store(sha: str, caption: str, size: int) -> None:
