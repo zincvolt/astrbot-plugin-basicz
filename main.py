@@ -479,8 +479,9 @@ VISION_HINTS = (
 # 读图预算单列，不跟聊天共用。原图一张 1000~2000 token，描述一句约 30 token。
 VISION_MAX_IMAGES = 2        # 一次请求最多放进几张原图
 VISION_PROMPT_CHARS = 800    # 图片描述最多占多少字（截图类描述更长）
-VISION_WAIT_SECONDS = 9.0    # 有图才等：盖住云端识图全链路（本地空试~4s + flash~2s + 抖动）
-                             # 只在「本轮带图且无缓存」时生效，没图/命中缓存都 0 等待
+VISION_WAIT_SECONDS = 9.0    # 本地识图（8085→8083→flash 兜底）全链路耗时
+VISION_WAIT_THIRD_PARTY = 4.0  # 第三方识图直连 flash（实测 ~2s），不用等满 9s
+                             # 两者都只在「本轮带图且无缓存」时生效，没图/命中缓存 0 等待
 VISION_POLL_SECONDS = 0.25
 # 截图/长图要给足字数：QQ空间截图、聊天记录一张就一大段文字，
 # 90 字截断等于把内容全丢了
@@ -1300,8 +1301,11 @@ async def _wait_for_captions(
     """Give the background captioner a few seconds before sending raw images.
 
     有图才等：本函数只在「本轮消息带图、且这批图没有可用缓存」时被调用。
-    无图 / 命中缓存的路径根本不会走到这里，所以把窗口放宽到
-    ``VISION_WAIT_SECONDS`` 不会拖慢普通聊天。
+    无图 / 命中缓存的路径根本不会走到这里，所以放宽窗口不会拖慢普通聊天。
+
+    窗口按 /读图 模式分档：``local``（本地 VL/OCR + flash 兜底）链路慢，
+    给 ``VISION_WAIT_SECONDS``；``third_party`` 直连 flash 只要约 2 秒，
+    等 ``VISION_WAIT_THIRD_PARTY`` 就够，不用陪满 9 秒。``off`` 不读图，不等。
 
     等待的产出是让后台识图把描述写进共享缓存。判定用「任一命中」而非
     「全部命中」：一次发多张图时，识图是逐张串行补描述的，等全部命中
@@ -1316,6 +1320,9 @@ async def _wait_for_captions(
     Returns:
         Seconds actually spent waiting (0 when nothing was waited for).
     """
+    mode = _vision_mode()
+    if mode == "off":
+        return 0.0
     if group_id:
         if not _vision_watches(group_id):
             return 0.0
@@ -1324,12 +1331,13 @@ async def _wait_for_captions(
             return 0.0
     else:
         return 0.0
-    # 云端兜底只补 ≤1.5 MiB 的图，更大的等也等不到
+    # 兜底只补 ≤1.5 MiB 的图，更大的等也等不到
     shas = [sha for _u, sha, size in unseen if sha and size <= VISION_STICKER_BYTES]
     if not shas:
         return 0.0
+    limit = VISION_WAIT_SECONDS if mode == "local" else VISION_WAIT_THIRD_PARTY
     start = time.time()
-    deadline = start + VISION_WAIT_SECONDS
+    deadline = start + limit
     while time.time() < deadline:
         # 任一命中即可：让已完成的描述先用上，不陪没完成的干等
         if any(_vision_peek(sha) for sha in shas):
@@ -1846,8 +1854,9 @@ class Main(star.Star):
                     sender_id = "" if group_id else str(event.get_sender_id() or "")
                     notes, unseen, budget = _split_images(req.image_urls)
                     if unseen:
-                        # 有图就多等几秒：后台 flash 补描述通常 1.5 秒就回来，
-                        # 等到了就不用把原图发出去（省 1500 token，答案还更稳）
+                        # 有图就等一会儿：等到描述就不用把原图发出去
+                        # （省 1500 token，答案还更稳）。窗口按 /读图 模式分档：
+                        # 第三方直连 flash 约 2 秒，本地 VL+兜底慢才等得久。
                         # 私聊也等：vision_context 现在私聊也写缓存
                         waited = await _wait_for_captions(
                             unseen, group_id, sender_id
